@@ -1,0 +1,17 @@
+# Zig 构建产物
+.zig-cache/
+zig-out/
+
+# 演示运行时产物（账本与沙箱）
+.sovereign_journal.jsonl
+.sovereign_ollama_journal.jsonl
+.sovereign_scenario_journal.jsonl
+.sovereign_sandbox/
+.sovereign_scenario_sandbox/
+
+# 测试临时文件
+.test_*.jsonl
+probe.txt
+
+.DS_Store
+.*/
