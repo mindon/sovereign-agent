@@ -10,15 +10,11 @@
 //! 物理只读探针仍会拦截——这正是“分层信任 + 零信任校验”的价值所在。
 
 const std = @import("std");
-const lib = @import("root.zig");
+const lib = @import("sovereign");
 
 const Action = lib.Action;
 const Dir = std.Io.Dir;
-const OllamaClient = lib.OllamaClient;
-
-/// 可用环境变量覆盖；默认连接本地 Ollama 的 gemma4:latest。
-const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
-const DEFAULT_MODEL = "gemma4:latest";
+const LlmClient = lib.LlmClient;
 
 const SYSTEM_PROMPT =
     \\You are the DECISION CORE of "Sovereign-Agent", a zero-trust autonomous agent.
@@ -68,7 +64,7 @@ fn extractJsonObject(s: []const u8) []const u8 {
     return s[start .. end + 1];
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state = std.heap.DebugAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const a = gpa_state.allocator();
@@ -78,9 +74,13 @@ pub fn main() !void {
     const io = threaded.io();
     const dir = Dir.cwd();
 
-    // 如需切换模型/端点，直接修改下面两个常量（如 "gemma4:31b"）。
-    const base_url = DEFAULT_BASE_URL;
-    const model = DEFAULT_MODEL;
+    // 运行配置来自环境变量（LLM_PROVIDER / LLM_BASE_URL / LLM_MODEL / LLM_API_KEY）。
+    // 默认连接本地 Ollama 的 gemma4:latest；设 LLM_PROVIDER=openai 可接入任意
+    // OpenAI 兼容端点（密钥仅来自 LLM_API_KEY / OPENAI_API_KEY）。
+    var cfg = try lib.EnvConfig.load(a, init.environ_map);
+    defer cfg.deinit();
+    const base_url = cfg.base_url;
+    const model = cfg.model;
 
     const sandbox = ".sovereign_sandbox";
     const journal_path = ".sovereign_ollama_journal.jsonl";
@@ -115,21 +115,21 @@ pub fn main() !void {
     // 一条危险的高置信度“幻觉”记忆：断言一个并不存在的文件存在。
     const halluc = try memory.addSeed("deploy.sh", "assert_exists=__ghost_binary__.bin", 0.9);
 
-    // —— 连接 Ollama ——
-    var client = OllamaClient.init(a, io, base_url, model);
+    // —— 连接推理后端（Ollama / OpenAI 兼容）——
+    var client = cfg.client(a, io);
     defer client.deinit();
 
-    std.debug.print("\n=== Sovereign-Agent × Ollama 演示 ===\n", .{});
-    std.debug.print("模型: {s}  端点: {s}\n\n", .{ model, base_url });
+    std.debug.print("\n=== Sovereign-Agent × LLM 演示 ===\n", .{});
+    std.debug.print("后端: {s}  模型: {s}  端点: {s}\n\n", .{ @tagName(cfg.provider), model, base_url });
 
     // 连通性预检：用一个最小 think 请求探活。
     {
         const ping = client.chat(a, "Reply with a single word: OK", "ping", false) catch |err| {
             std.debug.print(
-                \\[错误] 无法连接 Ollama ({s})。请确认：
-                \\  1) 已安装并启动 ollama serve；
-                \\  2) 已拉取模型：ollama pull {s}
-                \\  3) 端点正确（可用 OLLAMA_BASE_URL / OLLAMA_MODEL 覆盖）。
+                \\[错误] 无法连接推理后端 ({s})。请确认：
+                \\  1) Ollama: 已 ollama serve 且 ollama pull {s}；
+                \\  2) OpenAI 兼容: 设 LLM_PROVIDER=openai、LLM_BASE_URL、LLM_API_KEY；
+                \\  3) 端点正确（LLM_BASE_URL / LLM_MODEL 覆盖）。
                 \\
             , .{ @errorName(err), model });
             return;

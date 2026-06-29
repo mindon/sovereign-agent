@@ -26,6 +26,9 @@ pub const Executor = agent.Executor;
 pub const transact = agent.transact;
 pub const rebuildState = replay.rebuildState;
 pub const OllamaClient = llm.OllamaClient;
+pub const LlmClient = llm.LlmClient;
+pub const Provider = llm.Provider;
+pub const EnvConfig = llm.EnvConfig;
 pub const Decision = llm.Decision;
 
 test {
