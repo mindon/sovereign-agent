@@ -29,6 +29,8 @@ pub const Verdict = struct {
     reason: []const u8,
     /// 冲突的种子 id（若因记忆-事实冲突而失败），供上层标记 Contextual Exception。
     conflict_seed: ?u64 = null,
+    /// 作出裁决的行为层名称（Subsumption 审计用）。
+    layer: []const u8 = "",
 };
 
 /// 可插拔探针接口（vtable 风格）。
@@ -42,11 +44,72 @@ pub const Probe = struct {
     }
 };
 
+/// 单个行为层的判定函数：
+///   * 返回 `Verdict{ok=false}` → 否决（veto）；
+///   * 返回 `Verdict{ok=true}`  → 放行并短路（accept）；
+///   * 返回 `null`             → 本层弃权，交由更高层处置。
+pub const LayerFn = *const fn (ctx: *anyopaque, io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) anyerror!?Verdict;
+
+/// 一个具名行为层（用于外部注入的本能反射）。
+/// `ctx` 携带有状态反射所需上下文（如 *MemoryManager，供本能动态查询）；
+/// 无状态反射可忽略它。
+pub const Layer = struct {
+    name: []const u8,
+    ctx: *anyopaque = undefined,
+    check: LayerFn,
+};
+
+/// 资源预算：单次操作负载字节数上限（资源约束反射的示范阈值）。
+pub const MAX_PAYLOAD_BYTES: usize = 1 << 20;
+
+/// 包容式行为栈 (Subsumption Architecture)。
+///
+/// 评估顺序：低层（反射，优先级最高）→ 高层（启发式，优先级最低）。
+///   * 任一层 veto(ok=false) → 立即否决（低层反射抢占高层）；
+///   * 任一层 accept(ok=true) → 立即放行并短路（如 read-only 快路）；
+///   * 返回 null → 本层弃权，继续上升；全部弃权 → 默认放行。
+///
+/// 设计意义：危险/越权/资源类否决是**纯反射**——不依赖 LLM、毫秒级、绝对优先；
+/// 即便上层（LLM 规划）完全失控，下层反射仍是最终物理防线。
+pub const BehaviorStack = struct {
+    /// 外部注入的最高优先级反射层（先于内置安全包络）。
+    /// 供持续学习/本能烧录 (#4 Instinct) 注入“烧录”后的反射规则。
+    reflexes: []const Layer = &.{},
+
+    pub fn evaluate(self: BehaviorStack, io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !Verdict {
+        // 注入的本能反射（最高优先级）。
+        for (self.reflexes) |layer| {
+            if (try layer.check(layer.ctx, io, dir, action, seeds)) |v| return tagLayer(v, layer.name);
+        }
+        // 内置层：由低到高（反射优先）。
+        if (try layerSafetyEnvelope(io, dir, action, seeds)) |v| return tagLayer(v, "L0:safety-envelope");
+        if (try layerResourceConstraints(io, dir, action, seeds)) |v| return tagLayer(v, "L1:resource");
+        if (try layerHeuristic(io, dir, action, seeds)) |v| return tagLayer(v, "L2:heuristic");
+        return .{ .ok = true, .reason = "all behavior layers passed", .layer = "default" };
+    }
+};
+
+/// 给裁决补上裁决层名（若该层未自带）。
+fn tagLayer(v: Verdict, name: []const u8) Verdict {
+    var out = v;
+    if (out.layer.len == 0) out.layer = name;
+    return out;
+}
+
+fn veto(reason: []const u8) Verdict {
+    return .{ .ok = false, .reason = reason };
+}
+fn accept(reason: []const u8) Verdict {
+    return .{ .ok = true, .reason = reason };
+}
+
 pub const Arbiter = struct {
     io: Io,
     dir: Dir,
-    /// 可选的外部校验器；为空时使用内置默认探针。
+    /// 可选的外部校验器；为空时使用内置分层行为栈。
     probe: ?Probe = null,
+    /// 包容式行为栈（Subsumption）。可向 `stack.reflexes` 注入本能反射层。
+    stack: BehaviorStack = .{},
     /// 统计：异步预校验次数。
     async_checks: usize = 0,
     /// 统计：同步强校验次数。
@@ -71,7 +134,7 @@ pub const Arbiter = struct {
             const verdict = if (self.probe) |p|
                 try p.run(self.io, self.dir, action, seeds)
             else
-                try defaultProbe(self.io, self.dir, action, seeds);
+                try self.stack.evaluate(self.io, self.dir, action, seeds);
             self.last = verdict;
             return verdict.ok;
         } else {
@@ -181,26 +244,20 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// 内置默认只读探针（零信任物理校验，绝不产生副作用）：
-///   0. 越权读取：read 命中敏感资源（凭据/私钥/系统密码…）则拒绝；
-///   1. 负载非空（write/execute）；
-///   2. 路径穿越 / 沙箱逃逸：写目标(context)不得上跳或越出工作区；
-///   3. 危险命令：execute 负载命中破坏性黑名单则拒绝；
-///   4. 命令注入：execute 负载含命令替换/命令链接元字符则拒绝；
-///   5. 若负载为显式 .json 目标，则其必须可被解析（格式合法）；
-///   6. 防幻觉：若某记忆断言 `assert_exists=<path>` 而该路径在物理上不存在，
-///      则判定为“记忆与事实冲突”，拒绝该操作并指出冲突种子。
-pub fn defaultProbe(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !Verdict {
+/// Layer 0 —— 安全包络反射（最高内置优先级）：纯模式匹配，不触碰种子/格式，毫秒级。
+///   * 越权读取：read 命中敏感资源（凭据/私钥/系统密码…）则否决；
+///   * 路径穿越 / 沙箱逃逸：写目标(context)或负载含上跳序列、绝对/home 路径则否决；
+///   * 危险命令 + 命令注入：execute 负载命中破坏性黑名单 / 注入元字符则否决。
+/// read 非敏感者在此 accept 短路（read 无 payload，不应进入资源/格式层）。
+fn layerSafetyEnvelope(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !?Verdict {
+    _ = io;
+    _ = dir;
+    _ = seeds;
     // 越权读取（信息泄露防线）：read 不要求 payload，独立先行处理。
     if (action.action == .read) {
-        if (targetsSecret(action.context, action.payload)) {
-            return .{ .ok = false, .reason = "unauthorized read of sensitive resource blocked" };
-        }
-        return .{ .ok = true, .reason = "read-only probe passed" };
-    }
-
-    if (action.payload.len == 0) {
-        return .{ .ok = false, .reason = "empty payload rejected" };
+        if (targetsSecret(action.context, action.payload))
+            return veto("unauthorized read of sensitive resource blocked");
+        return accept("read-only probe passed");
     }
 
     // 零信任：路径穿越 / 沙箱逃逸（写目标 + 负载中的显式上跳序列）。
@@ -208,38 +265,48 @@ pub fn defaultProbe(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) 
         std.mem.indexOf(u8, action.payload, "../") != null or
         std.mem.indexOf(u8, action.payload, "..\\") != null)
     {
-        return .{ .ok = false, .reason = "path traversal / sandbox escape rejected" };
+        return veto("path traversal / sandbox escape rejected");
     }
 
     // 零信任：危险命令 + 命令注入拦截（execute）。
     if (action.action == .execute) {
-        if (matchDangerousCommand(action.payload)) |_| {
-            return .{ .ok = false, .reason = "dangerous command blocked by zero-trust policy" };
-        }
-        if (matchInjection(action.payload)) |_| {
-            return .{ .ok = false, .reason = "command injection blocked by zero-trust policy" };
-        }
+        if (matchDangerousCommand(action.payload)) |_|
+            return veto("dangerous command blocked by zero-trust policy");
+        if (matchInjection(action.payload)) |_|
+            return veto("command injection blocked by zero-trust policy");
     }
+    return null;
+}
 
-    // 格式合法性：仅对**显式 JSON 目标**（context 以 .json 结尾）强制校验。
-    // 不再用“首字符形似”的启发式——否则以 '[' 开头的纯文本/脚本
-    // （如 changelog "[Date] - ..."）会被误判为 JSON 数组而误杀。
+/// Layer 1 —— 资源约束反射：负载非空，且不超出资源预算（防资源耗尽）。
+fn layerResourceConstraints(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !?Verdict {
+    _ = io;
+    _ = dir;
+    _ = seeds;
+    if (action.payload.len == 0) return veto("empty payload rejected");
+    if (action.payload.len > MAX_PAYLOAD_BYTES) return veto("payload exceeds resource budget");
+    return null;
+}
+
+/// Layer 2 —— 记忆启发式校验（优先级最低、最慢）：
+///   * 格式合法性：仅对**显式 JSON 目标**（context 以 .json 结尾）强制校验；
+///   * 防幻觉：记忆断言 `assert_exists=<path>` 与物理事实冲突则否决并指出冲突种子。
+fn layerHeuristic(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !?Verdict {
     if (action.action == .write and std.mem.endsWith(u8, action.context, ".json")) {
         const trimmed = std.mem.trim(u8, action.payload, " \t\r\n");
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         _ = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), trimmed, .{}) catch {
-            return .{ .ok = false, .reason = "malformed JSON payload" };
+            return veto("malformed JSON payload");
         };
     }
 
-    // 防幻觉：检查高置信度记忆断言与物理事实是否冲突。
     const prefix = "assert_exists=";
     for (seeds) |s| {
         if (std.mem.startsWith(u8, s.content, prefix)) {
             const path = s.content[prefix.len..];
             dir.access(io, path, .{}) catch {
-                return .{
+                return Verdict{
                     .ok = false,
                     .reason = "hallucination: memory asserts a path that does not exist",
                     .conflict_seed = s.id,
@@ -247,8 +314,13 @@ pub fn defaultProbe(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) 
             };
         }
     }
+    return null;
+}
 
-    return .{ .ok = true, .reason = "read-only probe passed" };
+/// 内置默认只读探针 = 默认行为栈的评估（保持向后兼容的纯函数入口）。
+pub fn defaultProbe(io: Io, dir: Dir, action: Action, seeds: []const SeedClaim) !Verdict {
+    const stack: BehaviorStack = .{};
+    return stack.evaluate(io, dir, action, seeds);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,4 +497,75 @@ test "benign read is still async-passed (no false positive)" {
     try testing.expect(try arb.verify(a, &.{}));
     try testing.expect(arb.async_checks == 1);
     try testing.expect(arb.sync_checks == 0);
+}
+
+// —— Subsumption 行为栈 ——
+
+test "subsumption: injected reflex vetoes before built-in layers" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    const Reflex = struct {
+        fn check(_: *anyopaque, _: Io, _: Dir, action: Action, _: []const SeedClaim) anyerror!?Verdict {
+            // 本能反射：永不写入 "production" 上下文。
+            if (action.action == .write and std.mem.indexOf(u8, action.context, "production") != null)
+                return Verdict{ .ok = false, .reason = "instinct: never write production" };
+            return null; // 否则弃权
+        }
+    };
+    var dummy: u8 = 0;
+    const layers = [_]Layer{.{ .name = "instinct:no-prod", .ctx = @ptrCast(&dummy), .check = Reflex.check }};
+    arb.stack.reflexes = &layers;
+    // 该写操作本会通过内置层，但被注入的本能反射抢占否决。
+    const a: Action = .{ .id = 1, .action = .write, .context = "production.cfg", .payload = "{\"k\":1}" };
+    try testing.expect(!try arb.verify(a, &.{}));
+    try testing.expect(std.mem.indexOf(u8, arb.last.reason, "instinct") != null);
+    try testing.expectEqualStrings("instinct:no-prod", arb.last.layer);
+}
+
+test "subsumption: built-in safety reflex still vetoes when instinct abstains" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    const Noop = struct {
+        fn check(_: *anyopaque, _: Io, _: Dir, _: Action, _: []const SeedClaim) anyerror!?Verdict {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const layers = [_]Layer{.{ .name = "noop", .ctx = @ptrCast(&dummy), .check = Noop.check }};
+    arb.stack.reflexes = &layers;
+    const a: Action = .{ .id = 1, .action = .execute, .context = "x", .payload = "rm -rf /" };
+    try testing.expect(!try arb.verify(a, &.{}));
+    try testing.expectEqualStrings("L0:safety-envelope", arb.last.layer);
+}
+
+test "subsumption: resource budget reflex rejects oversized payload" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    const big = try testing.allocator.alloc(u8, MAX_PAYLOAD_BYTES + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'a');
+    const a: Action = .{ .id = 1, .action = .write, .context = "f", .payload = big };
+    try testing.expect(!try arb.verify(a, &.{}));
+    try testing.expectEqualStrings("L1:resource", arb.last.layer);
+}
+
+test "subsumption: verdict attributes deciding layer (heuristic)" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    const a: Action = .{ .id = 1, .action = .write, .context = "config.json", .payload = "{bad" };
+    try testing.expect(!try arb.verify(a, &.{}));
+    try testing.expectEqualStrings("L2:heuristic", arb.last.layer);
+}
+
+test "subsumption: clean write passes all layers (default verdict)" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    const a: Action = .{ .id = 1, .action = .write, .context = "notes.md", .payload = "hello" };
+    try testing.expect(try arb.verify(a, &.{}));
+    try testing.expectEqualStrings("default", arb.last.layer);
 }

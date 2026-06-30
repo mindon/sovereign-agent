@@ -78,6 +78,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-sabotage", .path = "examples/sabotage_test.zig", .desc = "黑盒测试一：幻觉拦截与惩罚 (The Sabotage Test)" },
         .{ .name = "example-cognitive-shift", .path = "examples/cognitive_shift_test.zig", .desc = "黑盒测试二：元认知行为改变 (The Cognitive Shift Test)" },
         .{ .name = "example-ledger-replay", .path = "examples/ledger_replay_test.zig", .desc = "黑盒测试三：金融级确定性重放 (Ledger Replay Test)" },
+        .{ .name = "example-subsumption", .path = "examples/subsumption_test.zig", .desc = "黑盒测试四：包容式行为栈 (The Subsumption Test)" },
+        .{ .name = "example-instinct", .path = "examples/instinct_test.zig", .desc = "黑盒测试五：持续学习与本能烧录 (The Instinct Test)" },
+        .{ .name = "example-stigmergy", .path = "examples/stigmergy_test.zig", .desc = "黑盒测试六：环境计算与去中心化协同 (The Stigmergy Test)" },
+        .{ .name = "example-routing", .path = "examples/routing_test.zig", .desc = "黑盒测试七：无状态路由拓扑 (The Stateless Routing Test)" },
     };
 
     const examples_step = b.step("examples", "Run all black-box example tests (offline, deterministic)");

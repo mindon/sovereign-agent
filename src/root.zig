@@ -9,6 +9,8 @@ pub const arbiter = @import("arbiter.zig");
 pub const agent = @import("agent.zig");
 pub const replay = @import("replay.zig");
 pub const llm = @import("llm.zig");
+pub const stigmergy = @import("stigmergy.zig");
+pub const router = @import("router.zig");
 
 // 常用类型再导出
 pub const ActionType = event.ActionType;
@@ -21,10 +23,17 @@ pub const Seed = memory.Seed;
 pub const Outcome = memory.Outcome;
 pub const Arbiter = arbiter.Arbiter;
 pub const Probe = arbiter.Probe;
+pub const Verdict = arbiter.Verdict;
+pub const BehaviorStack = arbiter.BehaviorStack;
+pub const Layer = arbiter.Layer;
 pub const AgentContext = agent.AgentContext;
 pub const Executor = agent.Executor;
 pub const transact = agent.transact;
 pub const rebuildState = replay.rebuildState;
+pub const Stigmergy = stigmergy.Stigmergy;
+pub const Route = router.Route;
+pub const RouteResult = router.RouteResult;
+pub const dispatch = router.dispatch;
 pub const OllamaClient = llm.OllamaClient;
 pub const LlmClient = llm.LlmClient;
 pub const Provider = llm.Provider;
