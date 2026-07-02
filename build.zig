@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-instinct", .path = "examples/instinct_test.zig", .desc = "黑盒测试五：持续学习与本能烧录 (The Instinct Test)" },
         .{ .name = "example-stigmergy", .path = "examples/stigmergy_test.zig", .desc = "黑盒测试六：环境计算与去中心化协同 (The Stigmergy Test)" },
         .{ .name = "example-routing", .path = "examples/routing_test.zig", .desc = "黑盒测试七：无状态路由拓扑 (The Stateless Routing Test)" },
+        .{ .name = "example-persona", .path = "examples/persona_test.zig", .desc = "黑盒测试八：专家模式切换 (The Persona Test)" },
     };
 
     const examples_step = b.step("examples", "Run all black-box example tests (offline, deterministic)");

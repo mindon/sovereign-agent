@@ -16,6 +16,8 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 /// 本能烧录阈值：连续成功次数达此值且置信度足够高 → 晋升为本能 (Instinct)。
+/// 注：这些 `pub const` 现降级为 `MemoryManager` 同名实例字段的**默认值来源**，
+/// 保留于此以维持向后兼容与语义锚点；专家模式 (persona) 可按画像覆盖实例字段。
 pub const INSTINCT_PROMOTE_SUCCESSES: u32 = 5;
 /// 本能晋升所需的最低置信度。
 pub const INSTINCT_PROMOTE_CONFIDENCE: f64 = 0.9;
@@ -79,6 +81,15 @@ pub const MemoryManager = struct {
     seeds: std.ArrayList(Seed) = .empty,
     next_id: u64 = 1,
     learning_rate: f64 = 0.1,
+    // —— 本能生命周期超参（实例字段，默认取模块常量，可被专家画像 persona 覆盖）——
+    /// 连续成功次数达此值且置信度足够高 → 晋升为本能。
+    instinct_promote_successes: u32 = INSTINCT_PROMOTE_SUCCESSES,
+    /// 本能晋升所需的最低置信度。
+    instinct_promote_confidence: f64 = INSTINCT_PROMOTE_CONFIDENCE,
+    /// 本能阻尼：本能失败时以 (learning_rate × 此系数) 衰减。
+    instinct_damping: f64 = INSTINCT_DAMPING,
+    /// 本能连续失败达此次数 → 解除烧录，回归软记忆。
+    instinct_unlearn_failures: u32 = INSTINCT_UNLEARN_FAILURES,
 
     pub fn init(gpa: Allocator) MemoryManager {
         return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -177,20 +188,20 @@ pub const MemoryManager = struct {
                     s.consecutive_failures = 0;
                     // 自动烧录：反复验证的高置信模式晋升为本能。
                     if (!s.instinct and
-                        s.success_count >= INSTINCT_PROMOTE_SUCCESSES and
-                        s.confidence >= INSTINCT_PROMOTE_CONFIDENCE)
+                        s.success_count >= self.instinct_promote_successes and
+                        s.confidence >= self.instinct_promote_confidence)
                     {
                         s.instinct = true;
                     }
                 },
                 .failure => {
                     // 本能享有阻尼：单次失败不足以撼动，需连续多次才解锁。
-                    const rate = if (s.instinct) self.learning_rate * INSTINCT_DAMPING else self.learning_rate;
+                    const rate = if (s.instinct) self.learning_rate * self.instinct_damping else self.learning_rate;
                     s.confidence = std.math.clamp(s.confidence - rate, 0.0, 1.0);
                     s.failure_count += 1;
                     s.consecutive_failures += 1;
                     // 解除烧录 (unlearning)：环境确已变化，本能降级回软记忆。
-                    if (s.instinct and s.consecutive_failures >= INSTINCT_UNLEARN_FAILURES) {
+                    if (s.instinct and s.consecutive_failures >= self.instinct_unlearn_failures) {
                         s.instinct = false;
                     }
                 },

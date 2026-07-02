@@ -110,6 +110,10 @@ pub const Arbiter = struct {
     probe: ?Probe = null,
     /// 包容式行为栈（Subsumption）。可向 `stack.reflexes` 注入本能反射层。
     stack: BehaviorStack = .{},
+    /// 敏感度档位（专家模式 persona 的“保守档”开关）：置真时，**所有**动作
+    /// （含 read/think）一律升级为同步强校验。这是**只增不减**的旋钮——
+    /// 它只会让校验更严，绝不会放松 L0 安全包络（零信任下界不可下调）。
+    strict_all: bool = false,
     /// 统计：异步预校验次数。
     async_checks: usize = 0,
     /// 统计：同步强校验次数。
@@ -126,7 +130,8 @@ pub const Arbiter = struct {
         // 敏感动作（write/execute）天然走同步强校验；
         // 此外，**越权读取**——即 read 命中敏感资源（凭据/私钥/系统密码…）——
         // 虽不产生副作用，但属信息泄露攻击面，零信任策略下同样升级为同步强校验。
-        const must_sync = action.action.isSensitive() or
+        const must_sync = self.strict_all or
+            action.action.isSensitive() or
             (action.action == .read and targetsSecret(action.context, action.payload));
         if (must_sync) {
             // —— 同步强校验 ——
@@ -497,6 +502,28 @@ test "benign read is still async-passed (no false positive)" {
     try testing.expect(try arb.verify(a, &.{}));
     try testing.expect(arb.async_checks == 1);
     try testing.expect(arb.sync_checks == 0);
+}
+
+test "sensitivity: strict_all escalates benign read to sync strong-check" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    arb.strict_all = true; // 保守档：所有动作走同步强校验
+    const a: Action = .{ .id = 1, .action = .read, .context = "config.json", .payload = "" };
+    try testing.expect(try arb.verify(a, &.{}));
+    try testing.expect(arb.sync_checks == 1);
+    try testing.expect(arb.async_checks == 0);
+}
+
+test "sensitivity: strict_all never relaxes L0 safety envelope" {
+    var t = std.Io.Threaded.init(testing.allocator, .{});
+    defer t.deinit();
+    var arb = Arbiter.init(t.io(), Dir.cwd());
+    arb.strict_all = true;
+    // 保守档不改变 L0 反射：危险命令依旧被否决。
+    const a: Action = .{ .id = 1, .action = .execute, .context = "x", .payload = "rm -rf /" };
+    try testing.expect(!try arb.verify(a, &.{}));
+    try testing.expectEqualStrings("L0:safety-envelope", arb.last.layer);
 }
 
 // —— Subsumption 行为栈 ——

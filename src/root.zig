@@ -11,6 +11,7 @@ pub const replay = @import("replay.zig");
 pub const llm = @import("llm.zig");
 pub const stigmergy = @import("stigmergy.zig");
 pub const router = @import("router.zig");
+pub const persona = @import("persona.zig");
 
 // 常用类型再导出
 pub const ActionType = event.ActionType;
@@ -39,6 +40,12 @@ pub const LlmClient = llm.LlmClient;
 pub const Provider = llm.Provider;
 pub const EnvConfig = llm.EnvConfig;
 pub const Decision = llm.Decision;
+pub const ExpertProfile = persona.ExpertProfile;
+pub const Session = persona.Session;
+pub const Registry = persona.Registry;
+pub const SeedSpec = persona.SeedSpec;
+pub const Sensitivity = persona.Sensitivity;
+pub const LlmOverride = persona.LlmOverride;
 
 test {
     std.testing.refAllDecls(@This());
