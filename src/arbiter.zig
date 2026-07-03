@@ -163,7 +163,7 @@ const DANGEROUS_PATTERNS = [_][]const u8{
     "mkfs",
     "dd if=",
     "> /dev/",
-    ":(){",       // fork bomb
+    ":(){", // fork bomb
     "shutdown",
     "reboot",
     "mv / ",
@@ -187,12 +187,12 @@ fn matchDangerousCommand(payload: []const u8) ?[]const u8 {
 /// 零信任策略下，受控的单条运维命令不应包含这些控制元字符——
 /// 一旦出现，视为试图在一条命令里夹带第二条命令（注入）。
 const INJECTION_PATTERNS = [_][]const u8{
-    "$(",   // command substitution
-    "`",    // backtick command substitution
-    "&&",   // chaining (AND)
-    "||",   // chaining (OR)
-    ";",    // chaining (sequence)
-    "\n",   // 多行夹带
+    "$(", // command substitution
+    "`", // backtick command substitution
+    "&&", // chaining (AND)
+    "||", // chaining (OR)
+    ";", // chaining (sequence)
+    "\n", // 多行夹带
 };
 
 /// 查找命令注入模式。命中返回该模式，否则 null。

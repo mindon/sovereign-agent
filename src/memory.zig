@@ -74,6 +74,30 @@ pub const Seed = struct {
     }
 };
 
+/// 回写用的种子投影：与 `persona.SeedSpec` / `persona_config.SeedConfig` **字段同构**，
+/// 但刻意定义在本模块内，以避免 `memory → persona` 的循环依赖。ZON 是结构化格式
+/// （靠字段名而非具体类型往返），故此投影可被 `std.zon.parse` 原样解析回 `SeedConfig`。
+///
+/// 仅承载声明式的 4 个字段：运行期统计（success/failure/consecutive_failures/exception）
+/// **不导出**——回写产物是"蒸馏后的知识资产"，不是运行时快照（后者归 journal 重放）。
+pub const SeedDump = struct {
+    context: []const u8,
+    content: []const u8,
+    confidence: f64,
+    instinct: bool,
+};
+
+/// LLM 在线蒸馏 (self-distillation) 产出的**待审知识**投影。刻意**不含 `instinct`
+/// 字段**：本能（L-1 零成本否决反射）只能靠运行期反复验证烧录或人工 review 晋升，
+/// 绝不允许模型一句话就写出一条无条件否决反射（否则幻觉直接变成硬约束）。
+///
+/// 生命周期归调用方（建议 arena）；由 `MemoryManager.ingestDistilled` 安全注入。
+pub const DistilledSeed = struct {
+    context: []const u8,
+    content: []const u8,
+    confidence: f64,
+};
+
 pub const MemoryManager = struct {
     gpa: Allocator,
     /// 持有种子内部字符串（content/context/exception）的所有权。
@@ -112,6 +136,45 @@ pub const MemoryManager = struct {
         try self.seeds.append(self.gpa, seed);
         self.next_id += 1;
         return seed.id;
+    }
+
+    /// 安全注入 LLM 在线蒸馏 (self-distillation) 产出的种子——**零信任**：
+    ///   * 置信度一律 clamp 到 `[0, max_confidence]`（建议上限 0.5，落入 danger/medium
+    ///     tier）：蒸馏产物是"待审知识"，天然低信任、需运行期验证或人工升级；
+    ///   * `instinct` **恒为 false**（`addSeed` 默认即 false）：本能只能靠反复成功
+    ///     烧录或人工 review 晋升，绝不能让模型一句话写成无条件否决反射；
+    ///   * 按 `domain` 打上下文标签（若 seed.context 未含 domain 则前缀 `domain:`），
+    ///     便于 `dumpSeedsZon`/`exportProfile` 按域切分导出、人工 `git diff` 审阅升级。
+    ///
+    /// 空内容的种子被跳过。返回实际注入的种子数。注意：本函数只负责"安全落库"，
+    /// 蒸馏产物应经 `exportProfile` 回写 `.zon` → 人工 PR 才算升级为正式专家资产
+    /// （与既有冷更新工作流一致），不应直接进离线确定性重放黑盒。
+    pub fn ingestDistilled(
+        self: *MemoryManager,
+        domain: []const u8,
+        seeds: []const DistilledSeed,
+        max_confidence: f64,
+    ) !usize {
+        const cap = std.math.clamp(max_confidence, 0.0, 1.0);
+        var n: usize = 0;
+        for (seeds) |s| {
+            if (s.content.len == 0) continue;
+            const conf = std.math.clamp(s.confidence, 0.0, cap);
+
+            // 按域打标签：domain 为空或已被 seed.context 覆盖则原样用，否则前缀 domain。
+            var tagged: ?[]u8 = null;
+            defer if (tagged) |t| self.gpa.free(t);
+            const ctx = blk: {
+                if (domain.len == 0) break :blk s.context;
+                if (contextMatches(domain, s.context)) break :blk s.context;
+                tagged = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ domain, s.context });
+                break :blk tagged.?;
+            };
+
+            _ = try self.addSeed(ctx, s.content, conf); // instinct 默认 false（零信任）
+            n += 1;
+        }
+        return n;
     }
 
     pub fn get(self: *MemoryManager, id: u64) ?*Seed {
@@ -292,6 +355,33 @@ pub const MemoryManager = struct {
     pub fn instinctReflex(self: *MemoryManager) arbiter.Layer {
         return .{ .name = "L-1:instinct", .ctx = @ptrCast(self), .check = instinctCheck };
     }
+
+    /// 能力③（积累回写）内核原语：把（可选按 `ctx_filter` 过滤的）**演进后**种子
+    /// 序列化为 ZON 数组值（`.{ .{ ... }, ... }`）写入 `writer`。
+    ///
+    /// 用途：运行中 `updateConfidence` 把置信度演进、把反复验证的 seed 烧录为 instinct，
+    /// 这些"积累"原本只活在内存/journal；本函数把它们回写为**可 review / 可 git 管理 /
+    /// 可移植**的声明式资产，与既有"确定性重放"哲学互补（回写产物可与 journal 重放交叉校验）。
+    ///
+    /// 采用 `std.zon.stringify`（浮点以 `{d}` 最短可往返表示、字符串标准转义），与
+    /// `persona_config` 的 `std.zon.parse` 对称，保证 load→learn→dump→reload 往返一致。
+    /// `ctx_filter` 非空时按域切分导出（如仅导出 `zig:std` 域）。
+    pub fn dumpSeedsZon(self: *MemoryManager, writer: *Writer, ctx_filter: ?[]const u8) !void {
+        var list: std.ArrayList(SeedDump) = .empty;
+        defer list.deinit(self.gpa);
+        for (self.seeds.items) |s| {
+            if (ctx_filter) |f| {
+                if (!contextMatches(s.context, f)) continue;
+            }
+            try list.append(self.gpa, .{
+                .context = s.context,
+                .content = s.content,
+                .confidence = s.confidence,
+                .instinct = s.instinct,
+            });
+        }
+        try std.zon.stringify.serialize(list.items, .{}, writer);
+    }
 };
 
 fn instinctCheck(
@@ -322,7 +412,7 @@ fn instinctCheck(
 }
 
 /// 上下文匹配：精确相等或子串包含（启发式）。
-fn contextMatches(seed_ctx: []const u8, query: []const u8) bool {
+pub fn contextMatches(seed_ctx: []const u8, query: []const u8) bool {
     if (std.mem.eql(u8, seed_ctx, query)) return true;
     if (query.len == 0 or seed_ctx.len == 0) return false;
     return std.mem.indexOf(u8, query, seed_ctx) != null or
@@ -481,6 +571,102 @@ test "stigmergy blend reorders seeds by environmental footprint" {
     defer testing.allocator.free(blended);
     try testing.expectEqual(@as(usize, 2), blended.len);
     try testing.expectEqual(b, blended[0]);
+}
+
+test "dumpSeedsZon emits evolved seeds as parseable ZON (with ctx filter)" {
+    var m = MemoryManager.init(testing.allocator);
+    defer m.deinit();
+    const a = try m.addSeed("zig:build", "installArtifact required for outputs", 0.8);
+    _ = try m.addSeed("zig:std:mem", "prefer std.mem.eql for byte compare", 0.7);
+    _ = try m.addSeed("network", "unrelated seed", 0.5);
+    // 让 a 演进：一次成功 → 0.9。
+    var ids = [_]u64{a};
+    m.updateConfidence(&ids, .success);
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    // 仅导出 zig 域（zig:build + zig:std:mem），排除 network。
+    try m.dumpSeedsZon(&w.writer, "zig");
+    const out = w.written();
+
+    // 结构性检查：演进后的置信度与内容都在，network 被过滤掉。
+    try testing.expect(std.mem.indexOf(u8, out, "installArtifact required for outputs") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "prefer std.mem.eql for byte compare") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "unrelated seed") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "0.9") != null); // a 演进后置信度
+
+    // 可被 std.zon.parse 原样解析回 []SeedDump（往返自洽）。
+    const src = try testing.allocator.allocSentinel(u8, out.len, 0);
+    defer testing.allocator.free(src);
+    @memcpy(src, out);
+    const parsed = try std.zon.parse.fromSliceAlloc([]SeedDump, testing.allocator, src, null, .{});
+    defer std.zon.parse.free(testing.allocator, parsed);
+    try testing.expectEqual(@as(usize, 2), parsed.len);
+    try testing.expectApproxEqAbs(@as(f64, 0.9), parsed[0].confidence, 1e-9);
+}
+
+test "dumpSeedsZon on empty selection yields empty tuple" {
+    var m = MemoryManager.init(testing.allocator);
+    defer m.deinit();
+    _ = try m.addSeed("a", "x", 0.5);
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try m.dumpSeedsZon(&w.writer, "no-such-context");
+    try testing.expectEqualStrings(".{}", w.written());
+}
+
+test "ingestDistilled clamps confidence, forces non-instinct, and tags by domain" {
+    var m = MemoryManager.init(testing.allocator);
+    defer m.deinit();
+
+    const distilled = [_]DistilledSeed{
+        // 模型给出过高置信度，应被 clamp 到 max_confidence（0.5）→ medium tier。
+        .{ .context = "build", .content = "prefer zig build --release=safe", .confidence = 0.95 },
+        // 已含 domain 前缀 → 不重复打标签。
+        .{ .context = "zig:std", .content = "use std.mem.eql for byte compare", .confidence = 0.2 },
+        // 空内容 → 跳过。
+        .{ .context = "noise", .content = "", .confidence = 0.4 },
+        // 即便模型想写 forbid，也只是软记忆（instinct=false），不会成为否决反射。
+        .{ .context = "deploy", .content = "forbid: never deploy on friday", .confidence = 1.0 },
+    };
+
+    const n = try m.ingestDistilled("zig", &distilled, 0.5);
+    try testing.expectEqual(@as(usize, 3), n); // 空内容被跳过
+    try testing.expectEqual(@as(usize, 3), m.seeds.items.len);
+
+    // 零信任红线：注入的种子一律非本能，且置信度不超过上限。
+    for (m.seeds.items) |s| {
+        try testing.expect(!s.instinct);
+        try testing.expect(s.confidence <= 0.5 + 1e-9);
+    }
+    try testing.expect(!m.hasInstincts());
+
+    // 第一条被 clamp 到 0.5（medium），且 context 被前缀为 "zig:build"。
+    const build_ids = try m.fetchSeeds(testing.allocator, "zig:build");
+    defer testing.allocator.free(build_ids);
+    try testing.expectEqual(@as(usize, 1), build_ids.len);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), m.get(build_ids[0]).?.confidence, 1e-9);
+    try testing.expectEqualStrings("zig:build", m.get(build_ids[0]).?.context);
+
+    // 已含 domain 的 context 不被重复前缀（仍是 "zig:std"，非 "zig:zig:std"）。
+    const std_ids = try m.fetchSeeds(testing.allocator, "zig:std");
+    defer testing.allocator.free(std_ids);
+    try testing.expect(std_ids.len >= 1);
+    try testing.expectEqualStrings("zig:std", m.get(std_ids[0]).?.context);
+}
+
+test "ingestDistilled with empty domain keeps raw context and honors max_confidence=0" {
+    var m = MemoryManager.init(testing.allocator);
+    defer m.deinit();
+    const distilled = [_]DistilledSeed{
+        .{ .context = "topic", .content = "some heuristic", .confidence = 0.9 },
+    };
+    // max_confidence=0 → 一切蒸馏知识都落到最不可信区（confidence=0，danger）。
+    _ = try m.ingestDistilled("", &distilled, 0.0);
+    try testing.expectEqual(@as(usize, 1), m.seeds.items.len);
+    try testing.expectEqualStrings("topic", m.seeds.items[0].context);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), m.seeds.items[0].confidence, 1e-9);
+    try testing.expectEqual(Tier.danger, m.seeds.items[0].tier());
 }
 
 test "instinct reflex vetoes forbidden pattern via behavior stack" {

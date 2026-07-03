@@ -60,6 +60,38 @@ pub fn build(b: *std.Build) void {
     const run_scenario_step = b.step("run-scenario", "Run the adversarial real-world zero-trust scenario test");
     run_scenario_step.dependOn(&run_scenario.step);
 
+    // —— 专家模式 (Persona) 端到端 demo：按 profile 实际构造不同 LlmClient（需网络/LLM）——
+    const persona_exe = b.addExecutable(.{
+        .name = "sovereign-agent-persona",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/persona_ollama.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sovereign", .module = lib_mod }},
+        }),
+    });
+    b.installArtifact(persona_exe);
+    const run_persona = b.addRunArtifact(persona_exe);
+    run_persona.step.dependOn(b.getInstallStep());
+    const run_persona_step = b.step("run-persona", "Run the expert-profile (Persona) end-to-end demo: build a distinct LlmClient per profile");
+    run_persona_step.dependOn(&run_persona.step);
+
+    // —— 在线自蒸馏 (Self-Distillation) demo：LLM 蒸馏知识 → 零信任注入 → 回写待审 .zon（需网络/LLM）——
+    const distill_exe = b.addExecutable(.{
+        .name = "sovereign-agent-distill",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/persona_distill_ollama.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sovereign", .module = lib_mod }},
+        }),
+    });
+    b.installArtifact(distill_exe);
+    const run_distill = b.addRunArtifact(distill_exe);
+    run_distill.step.dependOn(b.getInstallStep());
+    const run_distill_step = b.step("run-distill", "Run the online self-distillation demo: LLM distills knowledge -> zero-trust ingest -> write-back a review-pending .zon");
+    run_distill_step.dependOn(&run_distill.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -83,6 +115,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-stigmergy", .path = "examples/stigmergy_test.zig", .desc = "黑盒测试六：环境计算与去中心化协同 (The Stigmergy Test)" },
         .{ .name = "example-routing", .path = "examples/routing_test.zig", .desc = "黑盒测试七：无状态路由拓扑 (The Stateless Routing Test)" },
         .{ .name = "example-persona", .path = "examples/persona_test.zig", .desc = "黑盒测试八：专家模式切换 (The Persona Test)" },
+        .{ .name = "example-persona-config", .path = "examples/persona_config_test.zig", .desc = "黑盒测试九：配置驱动的可插拔专家 (Pluggable Persona Config)" },
+        .{ .name = "example-persona-export", .path = "examples/persona_export_test.zig", .desc = "黑盒测试十：专家积累的回写闭环 (Persona Write-back Closure)" },
     };
 
     const examples_step = b.step("examples", "Run all black-box example tests (offline, deterministic)");

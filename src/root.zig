@@ -12,6 +12,7 @@ pub const llm = @import("llm.zig");
 pub const stigmergy = @import("stigmergy.zig");
 pub const router = @import("router.zig");
 pub const persona = @import("persona.zig");
+pub const persona_config = @import("persona_config.zig");
 
 // 常用类型再导出
 pub const ActionType = event.ActionType;
@@ -40,12 +41,28 @@ pub const LlmClient = llm.LlmClient;
 pub const Provider = llm.Provider;
 pub const EnvConfig = llm.EnvConfig;
 pub const Decision = llm.Decision;
+// —— 在线自蒸馏（LLM 蒸馏知识 → 零信任注入 memory）——
+pub const DistilledSeed = memory.DistilledSeed;
+pub const distillSystemPrompt = llm.DISTILL_SYSTEM_PROMPT;
+pub const parseDistilled = llm.parseDistilled;
 pub const ExpertProfile = persona.ExpertProfile;
 pub const Session = persona.Session;
 pub const Registry = persona.Registry;
 pub const SeedSpec = persona.SeedSpec;
 pub const Sensitivity = persona.Sensitivity;
 pub const LlmOverride = persona.LlmOverride;
+// —— 配置驱动的可插拔专家（从 ZON 配置运行时加载）——
+pub const ProfileConfig = persona_config.ProfileConfig;
+pub const SeedConfig = persona_config.SeedConfig;
+pub const LlmConfig = persona_config.LlmConfig;
+pub const ConfigRegistry = persona_config.ConfigRegistry;
+pub const loadPersonaBytes = persona_config.loadBytes;
+pub const loadPersonaFile = persona_config.loadFile;
+pub const loadPersonaDir = persona_config.loadDir;
+// —— 能力③：memory → .zon 回写（config ↔ memory 往返闭环）——
+pub const exportProfile = persona_config.exportProfile;
+pub const metaFromProfile = persona_config.metaFromProfile;
+pub const SeedDump = memory.SeedDump;
 
 test {
     std.testing.refAllDecls(@This());

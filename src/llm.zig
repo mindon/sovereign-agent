@@ -20,16 +20,22 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const memory = @import("memory.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ActionType = event.ActionType;
+
+/// 蒸馏产出的种子投影（复用 `memory.DistilledSeed`：context/content/confidence，
+/// **无 instinct 字段**——本能绝不能由模型直接写出）。别名仅为在本模块内命名清晰。
+pub const DistilledSeed = memory.DistilledSeed;
 
 pub const LlmError = error{
     HttpStatus,
     BadResponse,
     BadDecision,
     UnknownAction,
+    BadDistillation,
 };
 
 /// 推理后端类型。
@@ -137,7 +143,68 @@ pub const LlmClient = struct {
             .openai => parseOpenAiContent(gpa, raw),
         };
     }
+
+    /// **在线自蒸馏 (self-distillation)**：让 LLM 把一段原始知识文本 `raw_text` 蒸馏成
+    /// 结构化启发式种子（JSON），供 `memory.ingestDistilled` **零信任**安全注入。
+    ///
+    /// 契约（强制 JSON 对象输出）：`{"seeds":[{"context":"...","content":"...","confidence":0.x}, ...]}`
+    ///   * `content` 是一条**简洁、可验证**的启发式假设（非全文摘录）；
+    ///   * `confidence ∈ [0, 0.5]`：蒸馏产物是"待审知识"，天然低信任；
+    ///   * 输出**不含** instinct/forbid 反射——本能只能靠运行期验证或人工 review 烧录。
+    ///
+    /// 内存：`gpa` 用于 HTTP 传输期临时分配（内部释放）；返回的种子字符串分配在 `arena`
+    /// 上（leaky，随 arena 释放）。安全性：只访问显式配置的 `base_url`，不发起任意外联、
+    /// 不执行 shell；喂给本函数的 `raw_text` 应由调用方在白名单内抓取（防 SSRF）。
+    pub fn distill(
+        self: *LlmClient,
+        gpa: Allocator,
+        arena: Allocator,
+        domain: []const u8,
+        raw_text: []const u8,
+    ) ![]const DistilledSeed {
+        var up: std.Io.Writer.Allocating = .init(gpa);
+        defer up.deinit();
+        try up.writer.print(
+            "DOMAIN: {s}\n\nRAW KNOWLEDGE (distill heuristics from the text below; do not invent facts):\n{s}",
+            .{ domain, raw_text },
+        );
+
+        const content = try self.chat(gpa, DISTILL_SYSTEM_PROMPT, up.writer.buffered(), true);
+        defer gpa.free(content);
+        return parseDistilled(arena, content);
+    }
 };
+
+/// 自蒸馏系统提示词：约束模型只输出结构化、低信任、可验证的启发式种子。
+pub const DISTILL_SYSTEM_PROMPT =
+    \\You are a KNOWLEDGE DISTILLER for a zero-trust autonomous agent's memory.
+    \\Read the raw knowledge text and distill it into a small set of concise,
+    \\independently VERIFIABLE heuristic seeds. Do NOT copy long passages; do NOT
+    \\invent facts not supported by the text.
+    \\
+    \\Reply with STRICTLY a single JSON object (no markdown, no prose):
+    \\{"seeds":[{"context":"<short domain tag>","content":"<one verifiable heuristic>","confidence":<0.0-0.5>}, ...]}
+    \\
+    \\Hard rules:
+    \\  - Each "content" is ONE actionable, testable assumption (not a summary).
+    \\  - "confidence" MUST be between 0.0 and 0.5: distilled knowledge is UNTRUSTED
+    \\    until verified at runtime; never claim high confidence.
+    \\  - NEVER output instincts, reflexes, or unconditional "forbid/veto" rules:
+    \\    those are earned only by repeated runtime success or human review.
+    \\  - Prefer 3-8 seeds. If the text yields nothing useful, return {"seeds":[]}.
+;
+
+/// 解析模型输出的蒸馏 JSON（`{"seeds":[...]}`）。种子字符串分配在传入的 `arena`
+/// 上（leaky）。安全：`ignore_unknown_fields=true` 容忍模型多吐字段（含它若擅自
+/// 添加的 instinct 字段——本投影根本不含该字段，会被安全忽略，绝不会被注入）。
+pub fn parseDistilled(arena: Allocator, content: []const u8) ![]const DistilledSeed {
+    const Raw = struct {
+        seeds: []const DistilledSeed,
+    };
+    const raw = std.json.parseFromSliceLeaky(Raw, arena, content, .{ .ignore_unknown_fields = true }) catch
+        return LlmError.BadDistillation;
+    return raw.seeds;
+}
 
 /// 向后兼容别名：原 Ollama 专用客户端，保留四参 init 签名。
 pub const OllamaClient = struct {
@@ -479,4 +546,58 @@ test "parseDecision tolerates missing reason" {
     const d = try parseDecision(arena.allocator(), content);
     try testing.expectEqual(ActionType.read, d.action);
     try testing.expectEqualStrings("", d.reason);
+}
+
+test "parseDistilled extracts seeds and ignores model-injected instinct field" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // 模型擅自塞了 "instinct":true —— 投影无此字段，被安全忽略（绝不会被注入为本能）。
+    const content =
+        \\{"seeds":[
+        \\  {"context":"zig:build","content":"installArtifact required for outputs","confidence":0.4},
+        \\  {"context":"zig:std","content":"use std.mem.eql for byte compare","confidence":0.3,"instinct":true}
+        \\]}
+    ;
+    const seeds = try parseDistilled(arena.allocator(), content);
+    try testing.expectEqual(@as(usize, 2), seeds.len);
+    try testing.expectEqualStrings("zig:build", seeds[0].context);
+    try testing.expectApproxEqAbs(@as(f64, 0.4), seeds[0].confidence, 1e-9);
+    try testing.expectEqualStrings("use std.mem.eql for byte compare", seeds[1].content);
+}
+
+test "parseDistilled tolerates empty seed set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const seeds = try parseDistilled(arena.allocator(), "{\"seeds\":[]}");
+    try testing.expectEqual(@as(usize, 0), seeds.len);
+}
+
+test "parseDistilled rejects malformed JSON" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(LlmError.BadDistillation, parseDistilled(arena.allocator(), "not json"));
+}
+
+test "distilled seeds are safely injected as non-instinct, low-confidence memory" {
+    // 端到端（纯本地、无网络）：parseDistilled → ingestDistilled 的零信任约束。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const content =
+        \\{"seeds":[
+        \\  {"context":"build","content":"prefer release=safe","confidence":0.9},
+        \\  {"context":"deploy","content":"forbid: never deploy on friday","confidence":1.0}
+        \\]}
+    ;
+    const seeds = try parseDistilled(arena.allocator(), content);
+
+    var mem = memory.MemoryManager.init(testing.allocator);
+    defer mem.deinit();
+    const n = try mem.ingestDistilled("zig", seeds, 0.5);
+    try testing.expectEqual(@as(usize, 2), n);
+    // 零信任红线：无论模型给出多高置信度或 forbid 字样，注入后均为非本能、置信度受限。
+    try testing.expect(!mem.hasInstincts());
+    for (mem.seeds.items) |s| {
+        try testing.expect(!s.instinct);
+        try testing.expect(s.confidence <= 0.5 + 1e-9);
+    }
 }

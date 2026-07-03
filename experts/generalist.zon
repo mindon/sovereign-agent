@@ -1,0 +1,6 @@
+// 标准通用体：等价于空画像。standard 敏感度、无种子、默认角色。
+// 加载后作为基线专家；activate 后组合反射栈仅含 memory 本能反射一层。
+.{
+    .name = "generalist",
+    .description = "标准通用体：标准敏感度、无预置知识、默认角色",
+}

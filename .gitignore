@@ -3,11 +3,10 @@
 zig-out/
 
 # 演示运行时产物（账本与沙箱）
-.sovereign_journal.jsonl
-.sovereign_ollama_journal.jsonl
-.sovereign_scenario_journal.jsonl
-.sovereign_sandbox/
-.sovereign_scenario_sandbox/
+.sovereign_*.jsonl
+
+# 在线自蒸馏产物（待审知识；须人工 review 后才升级为正式专家资产）
+experts/*.distilled.zon
 
 # 测试临时文件
 .test_*.jsonl
